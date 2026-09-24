@@ -30,7 +30,7 @@
   #snapBtn:active { transform: translateX(-50%) scale(.93); }
 
   #hud { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); width: min(640px, 92vw);
-    text-align: center; pointer-events: none; z-index: 5; --heat: #ffe9c8; }
+    text-align: center; pointer-events: none; transition: opacity .6s; z-index: 5; --heat: #ffe9c8; }
   #hud::before { content: ""; position: absolute; inset: -30px -18% -24px; z-index: -1;
     background: radial-gradient(ellipse at 50% 40%, rgba(10,4,8,.72), rgba(10,4,8,.45) 50%, transparent 72%); }
   #popLabel { font: 500 10px "Cinzel", serif; letter-spacing: .5em; color: rgba(255,225,180,.7); }
@@ -146,6 +146,7 @@
 
 <div id="cam" class="hidden">
   <video id="video" autoplay playsinline muted></video>
+  <canvas id="glove3d"></canvas>
   <canvas id="overlay"></canvas>
   <div id="handState">手を探しています…</div>
 </div>
@@ -400,8 +401,24 @@ const PANTS = [0x22222a, 0x2a3450, 0x4a3a2a, 0x3a3a3a, 0x1a1a1a, 0x50483a];
 const SKINS = [0xf1c9a5, 0xe0ac86, 0xc68642, 0x8d5524, 0xffdbac];
 const ASH = new THREE.Color(0x3a3430);
 const humanMat = new THREE.MeshStandardMaterial({ roughness: 0.85, metalness: 0 });
-function part(geo) {
-  const m = new THREE.InstancedMesh(geo, humanMat, CAP);
+// Surface erosion is shared by the visible material and its shadow pass.
+function erosionShader(shader) {
+  shader.vertexShader = 'attribute float erosion; varying float vErosion; varying vec3 vSurface;\n' + shader.vertexShader;
+  shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvErosion = erosion; vSurface = position;');
+  shader.fragmentShader = 'varying float vErosion; varying vec3 vSurface;\n' + shader.fragmentShader;
+  shader.fragmentShader = shader.fragmentShader.replace('#include <clipping_planes_fragment>', `
+    #include <clipping_planes_fragment>
+    float grain = fract(sin(dot(floor(vSurface * 115.0), vec3(12.9898,78.233,45.164))) * 43758.5453);
+    if (vErosion > grain) discard;
+  `);
+}
+humanMat.onBeforeCompile = erosionShader;
+const humanDepth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+humanDepth.onBeforeCompile = erosionShader;
+function part(geo, capacity = CAP) {
+  geo.setAttribute('erosion', new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(THREE.DynamicDrawUsage));
+  const m = new THREE.InstancedMesh(geo, humanMat, capacity);
+  m.customDepthMaterial = humanDepth;
   m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   m.setColorAt(0, new THREE.Color());
   m.castShadow = true; m.frustumCulled = false; m.count = 0;
@@ -410,15 +427,24 @@ function part(geo) {
 }
 const torsoMesh = part(new THREE.CapsuleGeometry(0.13, 0.28, 4, 10));
 const headMesh = part(new THREE.SphereGeometry(0.1, 14, 10));
-const legMesh = part(new THREE.CapsuleGeometry(0.058, 0.4, 3, 8).translate(0, -0.26, 0));
-const armMesh = part(new THREE.CapsuleGeometry(0.043, 0.34, 3, 8).translate(0, -0.21, 0));
+const legMesh = part(new THREE.CapsuleGeometry(0.058, 0.4, 3, 8).translate(0, -0.26, 0), CAP * 2);
+const armMesh = part(new THREE.CapsuleGeometry(0.048, 0.15, 4, 10).translate(0, -0.105, 0), CAP * 2);
+const forearmMesh = part(new THREE.CapsuleGeometry(0.034, 0.14, 4, 10).translate(0, -0.10, 0), CAP * 2);
+const handMesh = part(new THREE.SphereGeometry(0.039, 10, 8), CAP * 2);
+const shoeMesh = part(new THREE.BoxGeometry(0.105, 0.07, 0.19).translate(0, 0, 0.035), CAP * 2);
+const hairMesh = part(new THREE.SphereGeometry(0.103, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.56));
+const noseMesh = part(new THREE.SphereGeometry(0.026, 8, 6));
+const beltMesh = part(new THREE.CylinderGeometry(0.12, 0.12, 0.045, 10));
+const HAIRS = [0x171310, 0x35251b, 0x725039, 0xaaa095, 0xbaa16a];
+const detailParts = [[hairMesh, 1, 'head'], [noseMesh, 1, 'head'], [beltMesh, 1, 'torso'],
+  [forearmMesh, 2, 'arms'], [handMesh, 2, 'arms'], [shoeMesh, 2, 'legs']];
 
 let humans = [];
 
 function spawnHuman(x, z, popIn = true) {
   const pick = a => new THREE.Color(a[(Math.random() * a.length) | 0]);
   const h = {
-    x, z, scale: 0.95 + Math.random() * 0.25, age: popIn ? 0 : 1,
+    x, z, width: 0.85 + Math.random() * 0.3, reaction: Math.random(), hair: pick(HAIRS), scale: 0.9 + Math.random() * 0.35, age: popIn ? 0 : 1,
     heading: Math.random() * Math.PI * 2, speed: 0.5 + Math.random() * 0.8,
     phase: Math.random() * 10, turnT: Math.random() * 3,
     doomed: false, dustIn: 0, ash: -1, emitted: 0,
@@ -435,7 +461,7 @@ const _c = new THREE.Color();
 function baseMatrix(h) {
   const pop = h.age < 0.4 ? easeOutBack(h.age / 0.4) : 1;
   _q.setFromAxisAngle(_up, -h.heading + Math.PI / 2);
-  return _base.compose(_p.set(h.x, 0, h.z), _q, _s.setScalar(h.scale * Math.max(0.01, pop)));
+  return _base.compose(_p.set(h.x, 0, h.z), _q, _s.set(h.scale * h.width * Math.max(0.01, pop), h.scale * Math.max(0.01, pop), h.scale * Math.max(0.01, pop)));
 }
 
 // 崩れる順番と時間帯（ash: 0→1）。最初の3割は色が灰色に抜けるだけ
@@ -444,7 +470,7 @@ const PART_WINDOW = { head: [0.3, 0.5], arms: [0.42, 0.68], torso: [0.55, 0.85],
 function partLeft(h, part) {
   if (h.ash < 0) return 1;
   const [a, b] = PART_WINDOW[part];
-  return Math.max(0.001, 1 - THREE.MathUtils.clamp((h.ash - a) / (b - a), 0, 1));
+  return 1 - THREE.MathUtils.clamp((h.ash - a) / (b - a), 0, 1);
 }
 function updateHumans(dt) {
   for (const h of humans) {
@@ -479,16 +505,42 @@ function updateHumans(dt) {
     const droop = h.doomed ? 0.25 : 0;
     const tremble = h.ash >= 0 && h.ash < 0.4 ? (Math.random() - 0.5) * 0.03 : 0;
 
-    _local.makeRotationX(droop * 0.4 + tremble).setPosition(0, 0.72 + bob, 0).scale(_s.setScalar(partLeft(h, 'torso')));
+    _local.makeRotationX(droop * 0.4 + tremble).setPosition(0, 0.72 + bob, 0).scale(_s.set(1.12, 1, 0.72));
     torsoMesh.setMatrixAt(i, _m.multiplyMatrices(_base, _local));
-    _local.makeRotationX(droop + tremble).setPosition(0, 1.03 + bob, droop * 0.05).scale(_s.setScalar(partLeft(h, 'head')));
+    _local.makeRotationX(droop + tremble).setPosition(0, 1.03 + bob, droop * 0.05).scale(_s.set(0.87, 1.12, 0.93));
     headMesh.setMatrixAt(i, _m.multiplyMatrices(_base, _local));
     for (const side of [-1, 1]) {
-      const leg = partLeft(h, 'legs'); // 腰から下へ向かって崩れ、最後は足元だけ残って消える
+      const leg = 1; // 腰から下へ向かって崩れ、最後は足元だけ残って消える
       _local.makeRotationX(swing * side).setPosition(side * 0.07, 0.52 * leg, 0).scale(_s.set(1, leg, 1));
       legMesh.setMatrixAt(i * 2 + (side > 0 ? 1 : 0), _m.multiplyMatrices(_base, _local));
-      _local.makeRotationX(-swing * side * 0.8 + droop * 0.3).setPosition(side * 0.175, 0.9 + bob, 0).scale(_s.setScalar(partLeft(h, 'arms')));
+      _local.makeRotationX(-swing * side * 0.8 + droop * 0.3).setPosition(side * 0.175, 0.9 + bob, 0);
       armMesh.setMatrixAt(i * 2 + (side > 0 ? 1 : 0), _m.multiplyMatrices(_base, _local));
+    }
+    // Hair, face, clothing seams and articulated bare forearms.
+    const detail = (mesh, index, x, y, z, rx, sx, sy, sz, color) => {
+      _local.makeRotationX(rx).setPosition(x, y, z).scale(_s.set(sx, sy, sz));
+      mesh.setMatrixAt(index, _m.multiplyMatrices(_base, _local));
+      mesh.setColorAt(index, _c.copy(color).lerp(ASH, ashK));
+    };
+    detail(hairMesh, i, 0, 1.055 + bob, -0.007, droop, 0.9, 1.05, 0.98, h.hair);
+    detail(noseMesh, i, 0, 1.025 + bob, 0.093, droop, 0.7, 1, 1.2, h.skin);
+    detail(beltMesh, i, 0, 0.515 + bob, 0, 0, 1.05, 1, 0.75, h.pants);
+    for (const side of [-1, 1]) {
+      const j = i * 2 + (side > 0 ? 1 : 0);
+      const upper = -swing * side * 0.8 + droop * 0.3;
+      const bend = h.doomed ? -0.8 - h.reaction * 0.8 : -0.18;
+      const elbowY = 0.9 + bob - Math.cos(upper) * 0.21;
+      const elbowZ = -Math.sin(upper) * 0.21;
+      detail(forearmMesh, j, side * 0.175, elbowY, elbowZ, upper + bend, 1, 1, 1, h.skin);
+      detail(handMesh, j, side * 0.175, elbowY - Math.cos(upper + bend) * 0.2,
+        elbowZ - Math.sin(upper + bend) * 0.2, upper + bend, 0.8, 1.15, 0.7, h.skin);
+      detail(shoeMesh, j, side * 0.07, 0.52 - Math.cos(swing * side) * 0.48,
+        -Math.sin(swing * side) * 0.48, swing * side, 1, 1, 1, h.pants);
+    }
+    for (const [mesh, count, body] of [[torsoMesh, 1, 'torso'], [headMesh, 1, 'head'],
+      [legMesh, 2, 'legs'], [armMesh, 2, 'arms'], ...detailParts]) {
+      const attr = mesh.geometry.attributes.erosion;
+      for (let j = 0; j < count; j++) attr.array[i * count + j] = 1 - partLeft(h, body);
     }
     torsoMesh.setColorAt(i, _c.copy(h.shirt).lerp(ASH, ashK));
     headMesh.setColorAt(i, _c.copy(h.skin).lerp(ASH, ashK));
@@ -497,8 +549,9 @@ function updateHumans(dt) {
     armMesh.setColorAt(i * 2, _c.copy(h.shirt).lerp(ASH, ashK));
     armMesh.setColorAt(i * 2 + 1, _c);
   }
-  for (const [m, k] of [[torsoMesh, 1], [headMesh, 1], [legMesh, 2], [armMesh, 2]]) {
+  for (const [m, k] of [[torsoMesh, 1], [headMesh, 1], [legMesh, 2], [armMesh, 2], ...detailParts]) {
     m.count = n * k;
+    m.geometry.attributes.erosion.needsUpdate = true;
     m.instanceMatrix.needsUpdate = true;
     m.instanceColor.needsUpdate = true;
   }
@@ -660,8 +713,8 @@ function sfxSnap() {
   src.connect(bp).connect(g).connect(a.destination); src.start(now);
   // ドーン
   const o = a.createOscillator(); o.type = 'sine';
-  o.frequency.setValueAtTime(90, now + 0.05); o.frequency.exponentialRampToValueAtTime(30, now + 1.5);
-  const g2 = a.createGain(); g2.gain.setValueAtTime(0.0001, now); g2.gain.exponentialRampToValueAtTime(0.7, now + 0.1);
+  o.frequency.setValueAtTime(90, now + 0.13); o.frequency.exponentialRampToValueAtTime(30, now + 1.5);
+  const g2 = a.createGain(); g2.gain.setValueAtTime(0.0001, now); g2.gain.exponentialRampToValueAtTime(0.7, now + 0.19);
   g2.gain.exponentialRampToValueAtTime(0.001, now + 1.8);
   o.connect(g2); out(g2, 0.8); o.start(now); o.stop(now + 2);
 }
@@ -717,7 +770,13 @@ function sfxDenied() {
 const $ = id => document.getElementById(id);
 let msgTimer = 0;
 function showMsg(html, sec = 1.8) { $('msg').innerHTML = html; $('msg').style.opacity = 1; msgTimer = sec; }
-let flashV = 0, shake = 0;
+let flashV = 0, shake = 0, impactPause = 0;
+const snapLight = new THREE.PointLight(0xffd6a0, 0, 45, 2);
+snapLight.position.set(0, 5, 0); scene.add(snapLight);
+const shockwave = new THREE.Mesh(new THREE.RingGeometry(0.95, 1, 128),
+  new THREE.MeshBasicMaterial({ color: 0xffdfb0, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false }));
+shockwave.rotation.x = -Math.PI / 2; shockwave.position.y = 0.07; scene.add(shockwave);
+let impactAge = 10;
 
 // ---------- ゲーム状態 ----------
 let playing = false, gameTime = 0, score = 0, charge = 0, birthAcc = 0, snaps = 0, bestMult = 1;
@@ -732,17 +791,20 @@ function resetGame() {
   for (let i = 0; i < START_POP; i++) spawnHuman((Math.random() - 0.5) * 4, (Math.random() - 0.5) * 4, false);
   gameTime = 0; score = 0; charge = 0; birthAcc = 0; snaps = 0; bestMult = 1; litStones = 0; aftermath = false; dispPop = START_POP;
   rollStoneTimes();
+  impactPause = 0; impactAge = 10; cine = 0; flashV = 0; shake = 0;
   playing = true;
   $('over').classList.add('hidden');
 }
 
 function snap() {
   if (!playing) return;
+  if (aftermath || impactPause > 0) return;
   if (charge < COOLDOWN) {
     sfxDenied();
     showMsg('<small>ストーンのチャージ中…</small>', 0.8);
     return;
   }
+  lastSnapAt = performance.now();
   const alive = humans.filter(h => !h.doomed);
   const n = alive.length;
   const kill = Math.floor(n / 2);
@@ -754,14 +816,14 @@ function snap() {
   // 何波かに分かれて灰になっていく
   for (let i = 0; i < kill; i++) { alive[i].doomed = true; alive[i].dustIn = 0.8 + Math.pow(Math.random(), 1.4) * 3.2; }
   aftermath = true; aftermathTail = 0; birthAcc = 0;
-  bgmTo(0.1, 0.3);
+  bgmTo(0.025, 0.08);
   const d = $('popDelta'); d.textContent = `−${kill}`;
   d.classList.remove('show'); void d.offsetWidth; d.classList.add('show');
   score += kill * mult;
   snaps++;
   charge = 0;
   rollStoneTimes();
-  flashV = 1; shake = 0.6; cine = 4.5;
+  flashV = 1; shake = 0.45; cine = 4.5; impactPause = 0.11; impactAge = 0;
   sfxSnap();
   navigator.vibrate?.([25, 40, 90]);
   if (mult === 3) showMsg(`PERFECT BALANCE<small>THE UNIVERSE BREATHES AGAIN　−${kill} ×3</small>`, 3.5);
@@ -875,7 +937,7 @@ function updateUI(dt) {
 
 // ---------- ハンドトラッキング（MediaPipe） ----------
 const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
-let handLandmarker = null, lastVideoTime = -1, lastSnapAt = 0;
+let handLandmarker = null, lastVideoTime = -1, lastSnapAt = -1e9;
 const handStates = [{}, {}];
 
 async function initCamera() {
@@ -928,6 +990,85 @@ const FINGERS = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], 
 const STONE_SPOTS = [[1, 2], [5, 6], [9, 10], [13, 14], [17, 18], 'center'];
 const DARK = '#2e1b03';
 const embers = [];
+
+// A separate transparent scene keeps the tracked armor in camera coordinates.
+let gloveRenderer = null, gloveCamera, gloveScene, gloves = [];
+function initGlove3D() {
+  if (gloveRenderer) return;
+  gloveRenderer = new THREE.WebGLRenderer({ canvas: $('glove3d'), alpha: true, antialias: true });
+  gloveRenderer.setSize(overlay.width, overlay.height, false);
+  gloveRenderer.setClearColor(0x000000, 0);
+  gloveRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+  gloveScene = new THREE.Scene();
+  gloveCamera = new THREE.OrthographicCamera(0, overlay.width, overlay.height, 0, 1, 4000);
+  gloveCamera.position.z = 2000;
+  gloveScene.add(new THREE.HemisphereLight(0xffefd1, 0x302044, 2));
+  const key = new THREE.DirectionalLight(0xffe6ac, 4);
+  key.position.set(-300, 700, 900); gloveScene.add(key);
+  const rim = new THREE.DirectionalLight(0x899dff, 3);
+  rim.position.set(800, 200, 300); gloveScene.add(rim);
+  const gold = new THREE.MeshStandardMaterial({ color: 0xbc8530, metalness: 0.72, roughness: 0.3 });
+  const seam = new THREE.MeshStandardMaterial({ color: 0x473015, metalness: 0.6, roughness: 0.55 });
+  const segmentGeo = new THREE.CylinderGeometry(0.82, 1, 1, 8);
+  const jointGeo = new THREE.SphereGeometry(1, 12, 8);
+  for (let h = 0; h < 2; h++) {
+    const root = new THREE.Group(); gloveScene.add(root);
+    const mesh = (geo, mat) => { const m = new THREE.Mesh(geo, mat); root.add(m); return m; };
+    const plate = mesh(new THREE.SphereGeometry(1, 10, 8), gold);
+    const cuff = mesh(new THREE.CylinderGeometry(0.75, 1, 1, 10), gold);
+    const segments = Array.from({ length: 15 }, () => mesh(segmentGeo, gold));
+    const joints = Array.from({ length: 15 }, () => mesh(jointGeo, seam));
+    const stones = STONE_COLORS.map(color => mesh(new THREE.IcosahedronGeometry(1, 1),
+      new THREE.MeshPhysicalMaterial({ color, metalness: 0.15, roughness: 0.12, clearcoat: 1, emissive: color, emissiveIntensity: 0 })));
+    const sockets = stones.map(() => mesh(new THREE.CylinderGeometry(1.35, 1.5, 0.4, 10).rotateX(Math.PI / 2), gold));
+    const lights = STONE_COLORS.map(color => { const l = new THREE.PointLight(color, 0, 500, 2); root.add(l); return l; });
+    gloves.push({ root, plate, cuff, segments, joints, stones, sockets, lights });
+  }
+}
+const gloveUp = new THREE.Vector3(0, 1, 0);
+function updateGlove3D(lm, index, palm, now) {
+  const g = gloves[index], W = overlay.width, H = overlay.height;
+  g.root.visible = true;
+  const pts = lm.map(p => new THREE.Vector3(p.x * W, H - p.y * H, -p.z * W));
+  const size = pts[0].distanceTo(pts[9]);
+  const forward = pts[9].clone().sub(pts[0]).normalize();
+  const across = pts[5].clone().sub(pts[17]).normalize();
+  const normal = across.clone().cross(forward).normalize();
+  if (normal.z < 0) normal.negate();
+  const basis = new THREE.Matrix4().makeBasis(forward.clone().cross(normal).normalize(), forward, normal);
+  const hub = pts[0].clone().lerp(pts[9], 0.45);
+  g.plate.position.copy(hub); g.plate.quaternion.setFromRotationMatrix(basis);
+  g.plate.scale.set(size * 0.63, size * 0.73, size * 0.23);
+  g.cuff.position.copy(pts[0]).addScaledVector(forward, -size * 0.25);
+  g.cuff.quaternion.setFromRotationMatrix(basis); g.cuff.scale.set(size * 0.62, size * 0.6, size * 0.38);
+  FINGERS.forEach((finger, fi) => {
+    for (let k = 0; k < 3; k++) {
+      const a = pts[finger[k]], b = pts[finger[k + 1]], j = fi * 3 + k;
+      const width = size * (fi === 0 ? 0.16 : 0.13) * (1 - k * 0.12);
+      g.segments[j].position.copy(a).lerp(b, 0.5);
+      g.segments[j].quaternion.setFromUnitVectors(gloveUp, b.clone().sub(a).normalize());
+      g.segments[j].scale.set(width, a.distanceTo(b) * 0.9, width);
+      g.joints[j].position.copy(a); g.joints[j].scale.setScalar(width * 0.94);
+    }
+  });
+  const lit = now - lastSnapAt < 650 ? 6 : litCount();
+  STONE_SPOTS.forEach((spot, i) => {
+    const loc = spot === 'center' ? hub.clone() : pts[spot[0]].clone().lerp(pts[spot[1]], 0.4);
+    loc.addScaledVector(normal, size * (spot === 'center' ? 0.25 : 0.15));
+    const radius = size * (spot === 'center' ? 0.21 : 0.115);
+    const on = i < lit;
+    g.stones[i].visible = g.sockets[i].visible = !palm;
+    g.stones[i].position.copy(loc); g.stones[i].quaternion.setFromRotationMatrix(basis);
+    g.stones[i].scale.set(radius, radius * 1.15, radius * 0.65);
+    g.sockets[i].position.copy(loc).addScaledVector(normal, -radius * 0.35);
+    g.sockets[i].quaternion.setFromRotationMatrix(basis); g.sockets[i].scale.setScalar(radius);
+    g.stones[i].material.emissiveIntensity = on ? 1.2 + Math.sin(now / 250) * 0.3 : 0;
+    g.stones[i].material.color.set(on ? STONE_COLORS[i] : '#211c18');
+    g.lights[i].position.copy(loc).addScaledVector(normal, radius * 2);
+    g.lights[i].intensity = on && !palm ? size * size * 0.8 : 0;
+    g.lights[i].distance = size * 3;
+  });
+}
 
 function rgba(hex, a) {
   const n = parseInt(hex.slice(1), 16);
@@ -1014,6 +1155,7 @@ function drawGlove(ctx, lm, armed, now, palm = false) {
   ctx.save();
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
 
+  if (!gloveRenderer) {
   // ================= 装甲 =================
   // 手首のカフ
   const c = { x: P[0].x - dx * s * 0.3, y: P[0].y - dy * s * 0.3 };
@@ -1151,6 +1293,7 @@ function drawGlove(ctx, lm, armed, now, palm = false) {
     }
   }
 
+  }
   // ================= 光（加算合成） =================
   ctx.globalCompositeOperation = 'lighter';
   const pulse = 0.75 + Math.sin(now / 160) * 0.25;
@@ -1292,15 +1435,19 @@ function processHands() {
   const now = performance.now();
   const res = handLandmarker.detectForVideo(video, now);
   octx.clearRect(0, 0, overlay.width, overlay.height);
+  initGlove3D();
+  gloves.forEach(g => { g.root.visible = false; });
   let label = '手を探しています…', armed = false, anyPalm = false;
   (res.landmarks || []).forEach((lm, i) => {
     const r = detectSnap(lm, handStates[i] || (handStates[i] = {}), now);
     if (r === 'armed') armed = true;
-    if (r === 'snap' && now - lastSnapAt > 600) { lastSnapAt = now; snap(); }
+    if (r === 'snap' && now - lastSnapAt > 600) snap();
     const palm = facesPalm(lm, res.handedness?.[i]?.[0]?.categoryName, i);
     anyPalm = anyPalm || palm;
+    updateGlove3D(lm, i, palm, now);
     drawGlove(octx, lm, r === 'armed', now, palm);
   });
+  gloveRenderer.render(gloveScene, gloveCamera);
   drawCamFx(octx, now);
   if (res.landmarks?.length) label = armed ? '🤌 構え — そのまま鳴らせ！'
     : anyPalm ? '✋ 手のひら側（甲を向けるとストーンが見える）' : '✋ 手を検出（親指と中指をくっつけて）';
@@ -1355,9 +1502,17 @@ function loop() {
   const dt = Math.min(clock.getDelta(), 0.05);
   const t = clock.elapsedTime;
   processHands();
-  if (playing) updateGame(dt);
-  updateHumans(dt);
-  updateParticles(dt, t);
+  impactPause = Math.max(0, impactPause - dt);
+  const worldDt = impactPause > 0 ? 0 : dt;
+  if (playing) updateGame(worldDt);
+  updateHumans(worldDt);
+  updateParticles(worldDt, t);
+  impactAge += dt;
+  snapLight.intensity = 140 * Math.exp(-impactAge * 8);
+  shockwave.visible = impactAge < 1.4;
+  shockwave.scale.setScalar(1 + impactAge * 26);
+  shockwave.material.opacity = Math.max(0, 0.65 * (1 - impactAge / 1.4));
+  $('hud').style.opacity = aftermath ? '0.35' : '1';
   updateMotes(dt, t);
   updateUI(dt);
 
